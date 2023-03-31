@@ -1,30 +1,3 @@
-use bdk::{
-    bitcoin::{
-        util::psbt::PartiallySignedTransaction, Address, Network, Script, PublicKey
-    },
-    blockchain::ElectrumBlockchain,
-    database::MemoryDatabase,
-    descriptor::{Descriptor, policy::BuildSatisfaction},
-    electrum_client::Client,
-    SyncOptions,
-    Wallet,
-};
-
-use std::str::FromStr;
-
-// main
-// Create new Wallet?
-// Create Arb Wallet
-//   Seed? xPub?
-// Create Maker Wallet
-//   Seed? xPub?
-// Create Taker Wallet
-//   Seed? xPub?
-//
-// Get Coins
-// Maker Wallet Generate and Present Pubkey for new Faucet Coins
-// Taker Wallet Generate and Present Pubkey for new Fuacet Coins
-//
 // Tx 1 Creation
 // Maker Flow(wallet, input amount, output amount) -> PBST, pubkey (for multi-sig)
 // Taker Flow(wallet, input amount, output amount, maker pubkey, pbst) -> pbst
@@ -46,13 +19,7 @@ use std::str::FromStr;
 // Maker look for confirmation for Tx, checks all relevant balances once complete
 // Taker looks for confirmation for Tx, checks all relevant balances once complete
 
-
 // TODOs:
-// 1. Understand xPubs
-// 2. Understand Descriptors
-// 3. Implement Seed routines and Wallet creation
-// 4. Implement Get Coins routines
-// 5. Figure out how to top up wallet with testnet coins
 // 6. Understand PBST formatting while creating Tx1
 // 7. Implement Tx1 Creation
 // 8. Implement Tx1 tracking / database?
@@ -60,76 +27,157 @@ use std::str::FromStr;
 // 10. Implement Tx2 Creation
 // 11. Implement Tx2 confirmation check
 
-fn main() -> Result<(), bdk::Error> {
-    let electrum_url = "<electrum_server>";
-    let client = Client::new(electrum_url)?;
+use bdk::bitcoin::Network;
+use bdk::blockchain::ElectrumBlockchain;
+use bdk::database::MemoryDatabase;
+use bdk::electrum_client::Client;
+use bdk::keys::{DerivableKey, GeneratableKey, GeneratedKey, ExtendedKey, bip39::{Mnemonic, WordCount, Language}};
+use bdk::template::Bip84;
+use bdk::wallet::AddressIndex;
+use bdk::{miniscript, Wallet, KeychainKind, SyncOptions};
+
+fn main() {
+    let network = Network::Testnet;
+    let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
     let blockchain = ElectrumBlockchain::from(client);
 
-    let descriptor_str = "wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/0/*)";
-    let change_descriptor_str = "wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/1/*)";
+    let mut arb_wallet: Option<Wallet<MemoryDatabase>> = None;
+    let mut maker_wallet: Option<Wallet<MemoryDatabase>> = None;
+    let mut taker_wallet: Option<Wallet<MemoryDatabase>> = None;
 
-    let descriptor = Descriptor::from_str(&descriptor_str)?;
-    let change_descriptor = Descriptor::from_str(&change_descriptor_str)?;
+    println!("n3x BDK Derisk CLI");
 
-    let wallet = Wallet::new(
-        descriptor.clone(),
-        Some(change_descriptor.clone()),
-        Network::Testnet,
-        MemoryDatabase::default(),
-    )?;
+    // listen and process subscriptions
 
-    wallet.sync(&blockchain, SyncOptions::default())?;
+     loop {
+        // Sync
+        let mut wallets = Vec::<&Wallet<MemoryDatabase>>::new();
+        if let Some(arb_wallet) = &arb_wallet {
+            wallets.push(arb_wallet);
+        }
+        if let Some(maker_wallet) = &maker_wallet {
+            wallets.push(maker_wallet);
+        }
+        if let Some(taker_wallet) = &taker_wallet {
+            wallets.push(taker_wallet);
+        }
+        sync_wallets(wallets, &blockchain);
 
-    let input_amt = 100_000;
-    let output_amt = 80_000;
+        println!("=> Options");
+        println!("  1. Generate Seeds");
+        println!("  2. Seed Arbitrator Wallet");
+        println!("  3. Seed Maker Wallet");
+        println!("  4. Seed Taker Wallet");
+        println!("  5. Fund Maker Wallet");
+        println!("  6. Fund Taker Wallet");
 
-    let pubkeys = [
-        PublicKey::from_str("<pubkey1>")?,
-        PublicKey::from_str("<pubkey2>")?,
-    ];
-    let multisig_script = Script::new_multisig(2, &pubkeys);
-    let multisig_addr = Address::from_script(&multisig_script, Network::Testnet).unwrap();
+        println!("  7. Query Arbitrator Wallet");
+        println!("  8. Query Maker Wallet");
+        println!("  9. Query Taker Wallet");
 
-    let psbt = create_psbt(&wallet, input_amt, output_amt, multisig_addr).await?;
-
-    println!("Created PSBT: {}", base64::encode(&serialize(&psbt)));
-
-    Ok(())
+        let user_input = get_user_input();
+        {
+            match user_input.as_str() {
+                "1" => _ = generate_seeds(),
+                "2" => arb_wallet = Some(create_wallet(network)),
+                "3" => maker_wallet = Some(create_wallet(network)),
+                "4" => taker_wallet = Some(create_wallet(network)),
+                "5" => fund_wallet(&maker_wallet),
+                "6" => fund_wallet(&taker_wallet),
+                "7" => query_wallet(&arb_wallet),
+                "8" => query_wallet(&maker_wallet),
+                "9" => query_wallet(&taker_wallet),
+                _ => println!("Invalid input. Please input a number."),
+            }
+        }
+        println!("");
+    }
 }
 
-async fn create_psbt(
-    wallet: &Wallet<MemoryDatabase>,
-    input_amt: u64,
-    output_amt: u64,
-    multisig_addr: Address,
-) -> Result<PartiallySignedTransaction, Box<dyn std::error::Error>> {
-    // Ensure there are enough funds to cover the input amount
-    let balance = wallet.get_balance().await?;
-    if balance < input_amt {
-        return Err("Insufficient funds".into());
+// Common Util
+
+fn get_user_input() -> String {
+    let mut input = String::new();
+    _ = std::io::stdin().read_line(&mut input).unwrap();
+    println!("");
+
+    input.truncate(input.len() - 1);
+    input
+}
+
+fn sync_wallets(wallets: Vec<&Wallet<MemoryDatabase>>, blockchain: &ElectrumBlockchain) {
+    for wallet in wallets {
+        wallet.sync(blockchain, SyncOptions::default()).unwrap();
+    }
+}
+
+// Generate Seeds
+
+fn generate_seeds() -> Mnemonic {
+    // Generate fresh mnemonic
+    let mnemonic: GeneratedKey<_, miniscript::Segwitv0> = Mnemonic::generate((WordCount::Words12, Language::English)).unwrap();
+    // Convert mnemonic to string
+    let mnemonic_words = mnemonic.to_string();
+    // Parse a mnemonic
+    let mnemonic  = Mnemonic::parse(&mnemonic_words).unwrap();
+
+    println!("Generated Seeds: {}", mnemonic_words);
+    mnemonic
+}
+
+// Seed Wallet
+
+fn create_wallet(network: Network) -> Wallet<MemoryDatabase> {
+    println!("Please enter your seed (leave empty to generate new seeds):");
+    let seed_string = get_user_input();
+
+    let mnemonic: Mnemonic;
+    if seed_string.is_empty() {
+        mnemonic = generate_seeds();
+    } else {
+        mnemonic = Mnemonic::parse(&seed_string).unwrap();
     }
 
-    // Create a transaction builder
-    let mut tx_builder = wallet.build_tx();
+    // Generate the extended key
+    let xkey: ExtendedKey = mnemonic.into_extended_key().unwrap();
 
-    // Add the desired output
-    tx_builder.add_recipient(multisig_addr.script_pubkey(), output_amt);
+    // Get xprv from the extended key
+    let xprv = xkey.into_xprv(network).unwrap();
 
-    // Set an appropriate fee rate (in satoshis per vbyte)
-    tx_builder.set_fee_rate(bdk::FeeRate::from_sat_per_vb(2.0));
+    // Create the wallet
+    Wallet::new(
+        Bip84(xprv, KeychainKind::External),
+        Some(Bip84(xprv, KeychainKind::Internal)),
+        network,
+        MemoryDatabase::default(),
+    )
+    .unwrap()
+}
 
-    // Use the BranchAndBound coin selection algorithm
-    let mut cs = BranchAndBound::new(input_amt, 5);
-    tx_builder.coin_selection(cs.as_coin_selection());
+// Fund Wallet
 
-    // Enable change output
-    tx_builder.set_single_recipient(None);
+fn fund_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
+    match some_wallet {
+        Some(wallet) => {
+            // Generate a new receiving address
+            let testnet_address = wallet.get_address(AddressIndex::New).unwrap();
+            println!("Generated Address: {}", testnet_address.to_string());
+        }
+        None => println!("Wallet not found.")
+    }
+}
 
-    // Create the transaction
-    let (mut psbt, _details) = tx_builder.finish().unwrap();
+// Query Wallet
 
-    // Sign the transaction
-    wallet.sign(&mut psbt, BuildSatisfaction::default())?;
+fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
+    match some_wallet {
+        Some(wallet) => {
+            // Get the total wallet balance
+            let balance = wallet.get_balance().unwrap();
 
-    Ok(psbt)
+            // Print the balance
+            println!("Total wallet balance: {} satoshis", balance);
+        }
+        None => println!("Wallet not found.")
+    }
 }
