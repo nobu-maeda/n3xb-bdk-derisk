@@ -27,14 +27,18 @@
 // 10. Implement Tx2 Creation
 // 11. Implement Tx2 confirmation check
 
-use bdk::bitcoin::Network;
-use bdk::blockchain::ElectrumBlockchain;
+use std::borrow::Borrow;
+use std::ops::Deref;
+
+use bdk::bitcoin::{Network, Address};
+use bdk::blockchain::{ElectrumBlockchain, GetHeight};
 use bdk::database::MemoryDatabase;
 use bdk::electrum_client::Client;
 use bdk::keys::{DerivableKey, GeneratableKey, GeneratedKey, ExtendedKey, bip39::{Mnemonic, WordCount, Language}};
 use bdk::template::Bip84;
-use bdk::wallet::AddressIndex;
-use bdk::{miniscript, Wallet, KeychainKind, SyncOptions};
+use bdk::wallet::coin_selection::{DefaultCoinSelectionAlgorithm, CoinSelectionAlgorithm};
+use bdk::wallet::{AddressIndex, tx_builder};
+use bdk::{miniscript, Wallet, KeychainKind, SyncOptions, FeeRate, WeightedUtxo, LocalUtxo, Error, Utxo};
 
 fn main() {
     let network = Network::Testnet;
@@ -64,29 +68,36 @@ fn main() {
         sync_wallets(wallets, &blockchain);
 
         println!("=> Options");
-        println!("  1. Generate Seeds");
-        println!("  2. Seed Arbitrator Wallet");
-        println!("  3. Seed Maker Wallet");
-        println!("  4. Seed Taker Wallet");
-        println!("  5. Fund Maker Wallet");
-        println!("  6. Fund Taker Wallet");
-
-        println!("  7. Query Arbitrator Wallet");
-        println!("  8. Query Maker Wallet");
-        println!("  9. Query Taker Wallet");
+        println!("  1a. Seed Arbitrator Wallet");
+        println!("  1b. Seed Maker Wallet");
+        println!("  1c. Seed Taker Wallet");
+        println!("  2a. Fund Maker Wallet");
+        println!("  2b. Fund Taker Wallet");
+        println!("  3a. Query Arbitrator Wallet");
+        println!("  3b. Query Maker Wallet");
+        println!("  3c. Query Taker Wallet");
+        println!("  4a. Create Commit PSBT (Maker)");
+        println!("  4b. Create Commit PSBT (Taker)");
+        println!("  4c. Sign Commit PSBT (Taker)");
+        println!("  4d. Sign Commit PSBT (Maker)");
+        println!("  4e. Broadcast Commit Tx (Maker)");
+        println!("  5a. Create Payout PSBT (Taker)");
+        println!("  5b. Create Payout PSBT (Maker)");
+        println!("  5c. Sign Payout PSBT (Maker)");
+        println!("  5d. Sign Payout PSBT (Taker)");
+        println!("  5e. Broadcast Payout Tx (Taker)");
 
         let user_input = get_user_input();
         {
             match user_input.as_str() {
-                "1" => _ = generate_seeds(),
-                "2" => arb_wallet = Some(create_wallet(network)),
-                "3" => maker_wallet = Some(create_wallet(network)),
-                "4" => taker_wallet = Some(create_wallet(network)),
-                "5" => fund_wallet(&maker_wallet),
-                "6" => fund_wallet(&taker_wallet),
-                "7" => query_wallet(&arb_wallet),
-                "8" => query_wallet(&maker_wallet),
-                "9" => query_wallet(&taker_wallet),
+                "1a" => arb_wallet = Some(create_wallet(network)),
+                "1b" => maker_wallet = Some(create_wallet(network)),
+                "1c" => taker_wallet = Some(create_wallet(network)),
+                "2a" => fund_wallet(&maker_wallet),
+                "2b" => fund_wallet(&taker_wallet),
+                "3a" => query_wallet(&arb_wallet),
+                "3b" => query_wallet(&maker_wallet),
+                "3c" => query_wallet(&taker_wallet),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -181,3 +192,142 @@ fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
         None => println!("Wallet not found.")
     }
 }
+
+// Create Commit PSBT
+// This only introudce an input into the PSBT
+
+fn get_available_utxos(wallet: &Wallet<MemoryDatabase>) -> Vec<(LocalUtxo, usize)> {
+    // WARNING: This assumes that the wallet has enough funds to cover the input amount
+    wallet.list_unspent().unwrap()
+        .into_iter()
+        .map(|utxo| {
+            let keychain = utxo.keychain;
+            (
+                utxo,
+                wallet.get_descriptor_for_keychain(keychain)
+                    .max_satisfaction_weight()
+                    .unwrap(),
+            )
+        })
+        .collect()
+}
+
+const COINBASE_MATURITY: u32 = 100;
+
+fn preselect_utxos(wallet: &Wallet<MemoryDatabase>, 
+    blockchain: &ElectrumBlockchain, 
+    change_policy: tx_builder::ChangeSpendPolicy, 
+    must_only_use_confirmed_tx: bool
+) -> Result<Vec<WeightedUtxo>, Error> {
+    let mut may_spend = get_available_utxos(wallet);
+
+    // Make sure UTXOs at least have minimum number of confirmations
+    let satisfies_confirmed = may_spend
+        .iter()
+        .map(|u| {
+            wallet
+                .get_tx(&u.0.outpoint.txid, true)
+                .map(|tx| match tx {
+                    // We don't have the tx in the db for some reason,
+                    // so we can't know for sure if it's mature or not.
+                    // We prefer not to spend it.
+                    None => false,
+                    Some(tx) => {
+                        // Whether the UTXO is mature and, if needed, confirmed
+                        let mut spendable = true;
+                        if must_only_use_confirmed_tx && tx.confirmation_time.is_none() {
+                            return false;
+                        }
+                        if tx
+                            .transaction
+                            .expect("We specifically ask for the transaction above")
+                            .is_coin_base()
+                        {
+                            let current_height = blockchain.get_height().unwrap();
+                            match &tx.confirmation_time {
+                                Some(t) => {
+                                    // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
+                                    spendable &= (current_height.saturating_sub(t.height))
+                                        >= COINBASE_MATURITY;
+                                }
+                                None => spendable = false,
+                            }
+                        }
+                        spendable
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut i = 0;
+    may_spend.retain(|u| {
+        // WARNING: Removed check on Change Policy
+        let retain = satisfies_confirmed[i];
+        i += 1;
+        retain
+    });
+
+    let mut may_spend = may_spend
+        .into_iter()
+        .map(|(local_utxo, satisfaction_weight)| WeightedUtxo {
+            satisfaction_weight,
+            utxo: Utxo::Local(local_utxo),
+        })
+        .collect();
+
+    Ok(may_spend)
+}
+
+fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64) {
+    match some_wallet {
+        Some(wallet) => {
+            // Ensure there are enough funds to cover the input amount
+            let balance = wallet.get_balance().unwrap();
+            if balance < input_amt {
+                print!("Insufficient funds");
+                return;
+            }
+
+            let coin_selection_result = DefaultCoinSelectionAlgorithm::default().coin_select(
+                wallet.database().borrow().deref(),
+                vec![],
+                wallet.list_unspent(),
+                FeeRate::from_sat_per_vb(5.0),
+                input_amt,
+                0,
+            );
+
+
+
+            // Create a transaction builder
+            let mut tx_builder = wallet.build_tx();
+
+            // Satisfy the specified user amount
+            wallet.satisfy_user_amount(&mut tx_builder, input_amt).unwrap();
+
+            // Create the transaction
+            let (mut psbt, details) = tx_builder.finish().unwrap();
+ 
+            // Print the PSBT
+            println!("PSBT: {}", psbt);
+
+            // Print the transaction details
+            println!("Transaction details: {:?}", details);
+        }
+        None => println!("Wallet not found")
+    }
+}
+
+// Complete Commit PSBT
+// This adds an input into the PSBT, and also expects a 2 of 2 multisig output
+fn complete_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64, multisig_addr: Address, arb_addr: Address) {
+    // Add the desired output
+    tx_builder.add_recipient(multisig_addr.script_pubkey(), output_amt);
+}
+// Complete Commit PSBT with Arbitration HTLC
+// This adds an input into the PSBT, and also expects a 2 of 2 multisig output, with the arbitrator getting all funds on HTLC expiry
+
+// Sign Commit PSBT
+
+// Broadcast Commit Tx
+
