@@ -30,14 +30,14 @@
 use std::borrow::Borrow;
 use std::ops::Deref;
 
-use bdk::bitcoin::{Network, Address};
+use bdk::bitcoin::{Network, Script};
 use bdk::blockchain::{ElectrumBlockchain, GetHeight};
 use bdk::database::MemoryDatabase;
 use bdk::electrum_client::Client;
 use bdk::keys::{DerivableKey, GeneratableKey, GeneratedKey, ExtendedKey, bip39::{Mnemonic, WordCount, Language}};
 use bdk::template::Bip84;
 use bdk::wallet::coin_selection::{DefaultCoinSelectionAlgorithm, CoinSelectionAlgorithm};
-use bdk::wallet::{AddressIndex, tx_builder};
+use bdk::wallet::{AddressIndex};
 use bdk::{miniscript, Wallet, KeychainKind, SyncOptions, FeeRate, WeightedUtxo, LocalUtxo, Error, Utxo};
 
 fn main() {
@@ -98,6 +98,7 @@ fn main() {
                 "3a" => query_wallet(&arb_wallet),
                 "3b" => query_wallet(&maker_wallet),
                 "3c" => query_wallet(&taker_wallet),
+                "4a" => create_psbt(&maker_wallet, &blockchain, 500),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -216,7 +217,6 @@ const COINBASE_MATURITY: u32 = 100;
 
 fn preselect_utxos(wallet: &Wallet<MemoryDatabase>, 
     blockchain: &ElectrumBlockchain, 
-    change_policy: tx_builder::ChangeSpendPolicy, 
     must_only_use_confirmed_tx: bool
 ) -> Result<Vec<WeightedUtxo>, Error> {
     let mut may_spend = get_available_utxos(wallet);
@@ -260,14 +260,14 @@ fn preselect_utxos(wallet: &Wallet<MemoryDatabase>,
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut i = 0;
-    may_spend.retain(|u| {
+    may_spend.retain(|_u| {
         // WARNING: Removed check on Change Policy
         let retain = satisfies_confirmed[i];
         i += 1;
         retain
     });
 
-    let mut may_spend = may_spend
+    let may_spend = may_spend
         .into_iter()
         .map(|(local_utxo, satisfaction_weight)| WeightedUtxo {
             satisfaction_weight,
@@ -278,41 +278,45 @@ fn preselect_utxos(wallet: &Wallet<MemoryDatabase>,
     Ok(may_spend)
 }
 
-fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64) {
+fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, blockchain: &ElectrumBlockchain, input_amt: u64) {
     match some_wallet {
         Some(wallet) => {
             // Ensure there are enough funds to cover the input amount
             let balance = wallet.get_balance().unwrap();
-            if balance < input_amt {
+            if balance.confirmed < input_amt {
                 print!("Insufficient funds");
                 return;
             }
 
+            let optional_utxos = preselect_utxos(wallet, 
+                                                                   &blockchain, 
+                                                                   true).unwrap();
+
             let coin_selection_result = DefaultCoinSelectionAlgorithm::default().coin_select(
                 wallet.database().borrow().deref(),
                 vec![],
-                wallet.list_unspent(),
+                optional_utxos,
                 FeeRate::from_sat_per_vb(5.0),
                 input_amt,
-                0,
+                &Script::default(),
             );
 
-
+            println!("Coin Selection Result: {:?}", coin_selection_result);
 
             // Create a transaction builder
-            let mut tx_builder = wallet.build_tx();
+            // let mut tx_builder = wallet.build_tx();
 
             // Satisfy the specified user amount
-            wallet.satisfy_user_amount(&mut tx_builder, input_amt).unwrap();
+            // wallet.satisfy_user_amount(&mut tx_builder, input_amt).unwrap();
 
             // Create the transaction
-            let (mut psbt, details) = tx_builder.finish().unwrap();
+            // let (mut psbt, details) = tx_builder.finish().unwrap();
  
             // Print the PSBT
-            println!("PSBT: {}", psbt);
+            // println!("PSBT: {}", psbt);
 
             // Print the transaction details
-            println!("Transaction details: {:?}", details);
+            // println!("Transaction details: {:?}", details);
         }
         None => println!("Wallet not found")
     }
@@ -320,10 +324,10 @@ fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64) {
 
 // Complete Commit PSBT
 // This adds an input into the PSBT, and also expects a 2 of 2 multisig output
-fn complete_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64, multisig_addr: Address, arb_addr: Address) {
-    // Add the desired output
-    tx_builder.add_recipient(multisig_addr.script_pubkey(), output_amt);
-}
+// fn complete_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, input_amt: u64, multisig_addr: Address, arb_addr: Address) {
+//     // Add the desired output
+//     tx_builder.add_recipient(multisig_addr.script_pubkey(), output_amt);
+// }
 // Complete Commit PSBT with Arbitration HTLC
 // This adds an input into the PSBT, and also expects a 2 of 2 multisig output, with the arbitrator getting all funds on HTLC expiry
 
