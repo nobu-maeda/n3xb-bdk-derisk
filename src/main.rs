@@ -29,8 +29,10 @@
 
 use std::borrow::Borrow;
 use std::ops::Deref;
+use base64::{Engine as _, engine::general_purpose};
 
 use bdk::bitcoin::{Network, Script};
+use bdk::bitcoin::consensus::{deserialize, encode::serialize};
 use bdk::blockchain::{ElectrumBlockchain, GetHeight};
 use bdk::database::MemoryDatabase;
 use bdk::electrum_client::Client;
@@ -71,21 +73,21 @@ fn main() {
         println!("  1a. Seed Arbitrator Wallet");
         println!("  1b. Seed Maker Wallet");
         println!("  1c. Seed Taker Wallet");
-        println!("  2a. Fund Maker Wallet");
-        println!("  2b. Fund Taker Wallet");
+        println!("  2a. Generate Address from Maker Wallet");
+        println!("  2b. Generate Address from Taker Wallet");
         println!("  3a. Query Arbitrator Wallet");
         println!("  3b. Query Maker Wallet");
         println!("  3c. Query Taker Wallet");
-        println!("  4a. Create Commit PSBT (Maker)");
-        println!("  4b. Create Commit PSBT (Taker)");
-        println!("  4c. Sign Commit PSBT (Taker)");
-        println!("  4d. Sign Commit PSBT (Maker)");
-        println!("  4e. Broadcast Commit Tx (Maker)");
-        println!("  5a. Create Payout PSBT (Taker)");
-        println!("  5b. Create Payout PSBT (Maker)");
-        println!("  5c. Sign Payout PSBT (Maker)");
-        println!("  5d. Sign Payout PSBT (Taker)");
-        println!("  5e. Broadcast Payout Tx (Taker)");
+        println!("  4a. Create Maker Sell PSBT (Maker)");
+        println!("  4b. Complete Maker Sell PSBT (Taker)");
+        println!("  4c. Sign PSBT (Maker)");
+        println!("  4d. Broadcast Signed Tx (Maker)");
+        println!("  5a1. Create Maker Sell Payout PSBT (Maker)");
+        println!("  5a2. Create Payout PSBT (Taker)");
+        println!("  5b1. Sign Payout PSBT (Maker)");
+        println!("  5b2. Sign Payout PSBT (Taker)");
+        println!("  5c1. Broadcast Payout Tx (Maker)");
+        println!("  5c2. Broadcast Payout Tx (Taker)");
 
         let user_input = get_user_input();
         {
@@ -93,12 +95,12 @@ fn main() {
                 "1a" => arb_wallet = Some(create_wallet(network)),
                 "1b" => maker_wallet = Some(create_wallet(network)),
                 "1c" => taker_wallet = Some(create_wallet(network)),
-                "2a" => fund_wallet(&maker_wallet),
-                "2b" => fund_wallet(&taker_wallet),
+                "2a" => generate_addr(&maker_wallet),
+                "2b" => generate_addr(&taker_wallet),
                 "3a" => query_wallet(&arb_wallet),
                 "3b" => query_wallet(&maker_wallet),
                 "3c" => query_wallet(&taker_wallet),
-                "4a" => create_psbt(&maker_wallet, &blockchain, 500),
+                "4a" => create_maker_sell_psbt(&maker_wallet),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -166,9 +168,9 @@ fn create_wallet(network: Network) -> Wallet<MemoryDatabase> {
     .unwrap()
 }
 
-// Fund Wallet
+// Generate Address (to fund Wallet)
 
-fn fund_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
+fn generate_addr(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     match some_wallet {
         Some(wallet) => {
             // Generate a new receiving address
@@ -194,8 +196,7 @@ fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     }
 }
 
-// Create Commit PSBT
-// This only introudce an input into the PSBT
+// Select UTXO (not under use consideration)
 
 fn get_available_utxos(wallet: &Wallet<MemoryDatabase>) -> Vec<(LocalUtxo, usize)> {
     // WARNING: This assumes that the wallet has enough funds to cover the input amount
@@ -278,7 +279,7 @@ fn preselect_utxos(wallet: &Wallet<MemoryDatabase>,
     Ok(may_spend)
 }
 
-fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, blockchain: &ElectrumBlockchain, input_amt: u64) {
+fn select_utxos(some_wallet: &Option<Wallet<MemoryDatabase>>, blockchain: &ElectrumBlockchain, input_amt: u64) {
     match some_wallet {
         Some(wallet) => {
             // Ensure there are enough funds to cover the input amount
@@ -320,6 +321,61 @@ fn create_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, blockchain: &Electr
         }
         None => println!("Wallet not found")
     }
+}
+
+fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>) {
+    match some_wallet {
+        Some(wallet) => {
+            // Ask user for agreed upon payout amount
+            println!("What is the payout amount?");
+            let payout_amount = get_user_input().parse::<u64>().unwrap();
+
+            // Ask user for agreed upon maker bond amount
+            println!("What is the maker's bond amount?");
+            let bond_amount = get_user_input().parse::<u64>().unwrap();
+
+            // Create PSBT with a fixed fee as the total amount, receipient as the change address
+            let mut builder = wallet.build_tx();
+            builder.enable_rbf()
+                   .fee_absolute(payout_amount + bond_amount)
+                   .add_recipient(Script::new_op_return(&[]), 0);
+            let (psbt, details) = builder.finish().unwrap();
+
+            // Serialize and display PSBT
+            let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
+            println!("PSBT: {}", encoded_psbt);
+            println!("");
+            println!("Details: {:#?}", details);
+        }
+        None => println!("Wallet not found")
+    }
+}
+
+fn complete_maker_sell_psbt() {
+    // Ask user for the PSBT
+
+    // Ask user for the agree upon payout amount
+
+    // Ask user for the agreed upon taker bond amount
+
+    // Ask user for Maker's multi-sig Pubkey
+    
+    // Ask user for Arbitrator's Pubkey
+
+    // Generate a Pubkey to creates Multisig Address + HTLC Output
+
+    // Import PSBT
+
+    // Add Multisig Address + HTLC Output Script to PSBT, with amount set to payout + bonds
+
+    // We assume here that the Taker wallet will take care of
+    //   1. Adding sufficient UTXOs as input to satisfy the amount specified in the Multi-sig output along with the Maker's change output
+    //   2. Adding a change output for the Taker
+
+    // Taker signs PSBT
+
+    // Serialize and display PSBT
+
 }
 
 // Complete Commit PSBT
