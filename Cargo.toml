@@ -8,4 +8,5 @@ edition = "2021"
 [dependencies]
 bdk = { version = "0.27.1", default-features = true, features = ["all-keys"] }
 base64 = { version = "0.21.0" }
+miniscript = { version = "9.0", features = ["serde", "compiler"] }
 tokio = { version = "1", features = ["full"] }
