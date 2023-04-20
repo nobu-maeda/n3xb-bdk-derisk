@@ -28,17 +28,13 @@
 // 11. Implement Tx2 confirmation check
 
 use base64::{engine::general_purpose, Engine as _};
-use bdk::bitcoin::blockdata::{script, block};
-use miniscript::serde::__private::de;
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::ops::Deref;
+use bdk::bitcoin::util::bip32::ExtendedPrivKey;
 use std::str::FromStr;
 
 use bdk::bitcoin::consensus::{deserialize, encode::serialize};
 use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
 use bdk::bitcoin::{Network, Script};
-use bdk::blockchain::{ElectrumBlockchain, GetHeight, Blockchain};
+use bdk::blockchain::{ElectrumBlockchain, Blockchain};
 use bdk::database::MemoryDatabase;
 use bdk::electrum_client::Client;
 use bdk::keys::{
@@ -46,14 +42,13 @@ use bdk::keys::{
     DerivableKey, ExtendedKey, GeneratableKey, GeneratedKey,
 };
 use bdk::template::Bip84;
-use bdk::wallet::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
 use bdk::wallet::AddressIndex;
 use bdk::{
-    miniscript, Error, FeeRate, KeychainKind, LocalUtxo, SyncOptions, Utxo, Wallet, WeightedUtxo, SignOptions,
+    miniscript, KeychainKind, SyncOptions, Wallet, SignOptions,
 };
 
 use miniscript::policy::Concrete;
-use miniscript::{Descriptor, DefiniteDescriptorKey, DescriptorPublicKey};
+use miniscript::Descriptor;
 
 fn main() {
     let network = Network::Testnet;
@@ -63,9 +58,12 @@ fn main() {
     let mut arb_wallet: Option<Wallet<MemoryDatabase>> = None;
     let mut maker_wallet: Option<Wallet<MemoryDatabase>> = None;
     let mut taker_wallet: Option<Wallet<MemoryDatabase>> = None;
-    let mut multi_wallet: Option<Wallet<MemoryDatabase>> = None;
 
-    let mut commit_psbt = "".to_string();
+    let mut arb_xprv: Option<ExtendedPrivKey> = None;
+    let mut maker_xprv: Option<ExtendedPrivKey> = None;
+    let mut taker_xprv: Option<ExtendedPrivKey> = None;
+
+    let mut temp_psbt: Option<String> = None;
 
     println!("n3x BDK Derisk CLI");
 
@@ -89,47 +87,34 @@ fn main() {
         println!("  1a. Seed Arbitrator Wallet");
         println!("  1b. Seed Maker Wallet");
         println!("  1c. Seed Taker Wallet");
-        println!("  1d. Create Multi-Sig HTLC Wallet");
-        println!("  2a. Generate Address from Maker Wallet");
-        println!("  2b. Generate Address from Taker Wallet");
+        println!("  2a. Generate Pubkey from Arbitrator Wallet");
+        println!("  2b. Generate Address from Maker Wallet");
+        println!("  2c. Generate Address from Taker Wallet");
         println!("  3a. Query Arbitrator Wallet");
         println!("  3b. Query Maker Wallet");
         println!("  3c. Query Taker Wallet");
-        println!("  4a. Create Maker Sell PSBT (Maker)");
-        println!("  4b. Complete Maker Sell PSBT (Taker)");
-        println!("  4c. Sign PSBT (Maker)");
-        println!("  4d. Broadcast Signed Tx (Maker)");
-        println!("  4e. Print Current PSBT");
-        println!("  5a1. Create Maker Sell Payout PSBT (Maker)");
-        println!("  5a2. Create Payout PSBT (Taker)");
-        println!("  5b1. Sign Payout PSBT (Maker)");
-        println!("  5b2. Sign Payout PSBT (Taker)");
-        println!("  5c1. Broadcast Payout Tx (Maker)");
-        println!("  5c2. Broadcast Payout Tx (Taker)");
+        println!("  4a. Create Maker Sell PSBT (Maker)");  // Needs Payout amount, Bond amount. Also generates Maker pubkey
+        println!("  4b. Complete Maker Sell PSBT (Taker)");  // Needs Maker pubkey, Arb pubkey, Payout Amount, Bond Amount
+        println!("  4c. Sign & Broadcast PSBT (Maker)");
+        println!("  5a. Create Payout PSBT (Taker)");  // Needs Maker pubkey, Maker address, Maker amount, Taker amount
+        println!("  5b. Sign & Broadcast Payout PSBT (Maker)");  // Needs Taker pubkey
+        println!("  5c. Arbitrate Payout (Arbitrator)"); // Needs Taker pubkey, Maker pubkey, Payout address
 
         let user_input = get_user_input();
         {
             match user_input.as_str() {
-                "1a" => arb_wallet = Some(create_wallet(network)),
-                "1b" => maker_wallet = Some(create_wallet(network)),
-                "1c" => taker_wallet = Some(create_wallet(network)),
-                "1d" => {
-                    multi_wallet = Some(create_multisig_wallet(
-                        &maker_wallet,
-                        &taker_wallet,
-                        Network::Testnet
-                    ))
-                }
-                "2a" => generate_addr(&maker_wallet),
-                "2b" => generate_addr(&taker_wallet),
+                "1a" => (arb_wallet, arb_xprv) = create_wallet(network),
+                "1b" => (maker_wallet, maker_xprv) = create_wallet(network),
+                "1c" => (taker_wallet, taker_xprv) = create_wallet(network),
+                "2a" => _ = generate_pubkey(&arb_wallet),
+                "2b" => generate_addr(&maker_wallet),
+                "2c" => generate_addr(&taker_wallet),
                 "3a" => query_wallet(&arb_wallet),
                 "3b" => query_wallet(&maker_wallet),
                 "3c" => query_wallet(&taker_wallet),
-                "4a" => commit_psbt = create_maker_sell_psbt(&maker_wallet),
-                "4b" => commit_psbt = complete_maker_sell_psbt(&taker_wallet, &multi_wallet, &commit_psbt),
-                "4c" => commit_psbt = sign_psbt(&maker_wallet, &commit_psbt),
-                "4d" => broadcast_psbt(&blockchain, &commit_psbt),
-                "4e" => print_psbt(&commit_psbt),
+                "4a" => temp_psbt = Some(create_maker_sell_psbt(&maker_wallet)),
+                "4b" => temp_psbt = Some(complete_maker_sell_psbt(&taker_wallet, &taker_xprv, &temp_psbt)),
+                "4c" => sign_broadcast_psbt(&blockchain, &maker_wallet, &temp_psbt),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -154,7 +139,29 @@ fn sync_wallets(wallets: Vec<&Wallet<MemoryDatabase>>, blockchain: &ElectrumBloc
     }
 }
 
-// Generate Seeds
+fn create_trade_wallet(
+    a_xprv: &ExtendedPrivKey,
+    b_pubkey: String,
+    network: Network
+) -> Wallet<MemoryDatabase> {
+
+    // policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(576)))", maker_xkey, taker_xkey, arbs_xkey);
+    let policy_string = format!("thresh(2,pk({}),pk({}))", a_xprv.to_string(), b_pubkey);
+    println!("Policy: {}", policy_string);
+
+    let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
+    let descriptor = Descriptor::new_wsh(policy.compile().unwrap()).unwrap();
+
+    Wallet::new(
+        &format!("{}", descriptor),
+        None,
+        network,
+        MemoryDatabase::default(),
+    )
+    .unwrap()
+}
+
+// 1. Generate Seeds
 
 fn generate_seeds() -> Mnemonic {
     // Generate fresh mnemonic
@@ -169,9 +176,9 @@ fn generate_seeds() -> Mnemonic {
     mnemonic
 }
 
-// Seed Wallet
+// 1. Seed Wallet
 
-fn create_wallet(network: Network) -> Wallet<MemoryDatabase> {
+fn create_wallet(network: Network) -> (Option<Wallet<MemoryDatabase>>, Option<ExtendedPrivKey>) {
     println!("Please enter your seed (leave empty to generate new seeds):");
     let seed_string = get_user_input();
 
@@ -189,18 +196,19 @@ fn create_wallet(network: Network) -> Wallet<MemoryDatabase> {
     let xprv = xkey.into_xprv(network).unwrap();
 
     // Create the wallet
-    Wallet::new(
+    let wallet = Wallet::new(
         Bip84(xprv, KeychainKind::External),
         Some(Bip84(xprv, KeychainKind::Internal)),
         network,
         MemoryDatabase::default(),
     )
-    .unwrap()
+    .unwrap();
+
+    (Some(wallet), Some(xprv))
+
 }
 
-// Create Multisig HTLC Wallet. 
-// Doing implemenation for a watch only wallet for now.
-// Will add capability for one of them to be a signing wallet later.
+// 2a. Generate Pubkey
 
 fn extract_substring_between_brackets(input: &str) -> Option<String> {
     let start = input.find('(')?;
@@ -213,96 +221,29 @@ fn extract_substring_between_brackets(input: &str) -> Option<String> {
     }
 }
 
-fn get_new_descriptor(
-    wallet: &Wallet<MemoryDatabase>,
-    keychain: KeychainKind,
-) -> String {
+fn generate_pubkey(some_wallet: &Option<Wallet<MemoryDatabase>>) -> String {
+    let wallet = match some_wallet {
+        Some(wallet) => wallet,
+        None => {
+            println!("Wallet not found.");
+            return "".to_string();
+        }
+    };
     let new_address = wallet.get_address(AddressIndex::New).unwrap();
     let script_pubkey = new_address.script_pubkey();
     let secp = wallet.secp_ctx();
-    let xpub = wallet.get_descriptor_for_keychain(keychain);
+    let xpub = wallet.get_descriptor_for_keychain(KeychainKind::External);
     let (_, descriptor) = xpub.find_derivation_index_for_spk(secp, &script_pubkey, 0..100).unwrap().unwrap();
 
     println!("New Descriptor: {}", descriptor);
     println!("Original Adddress: {}, Derived Address: {}", new_address, descriptor.address(wallet.network()).unwrap());
 
     let extracted_key = extract_substring_between_brackets(descriptor.to_string().as_str()).unwrap();
-    println!("Extracted Key: {}", extracted_key);
+    println!("Extracted PubKey: {}", extracted_key);
     extracted_key
 }
 
-fn create_multisig_htlc_wallet(
-    maker_wallet: &Option<Wallet<MemoryDatabase>>,
-    taker_wallet: &Option<Wallet<MemoryDatabase>>,
-    arb_wallet: &Option<Wallet<MemoryDatabase>>,
-    network: Network,
-) -> Wallet<MemoryDatabase> {
-    let maker_xkey = match maker_wallet {
-        Some(wallet) => get_new_descriptor(wallet, KeychainKind::External),
-        None => panic!("Maker Wallet not found."),
-    };
-    let taker_xkey = match taker_wallet {
-        Some(wallet) => get_new_descriptor(wallet, KeychainKind::External),
-        None => panic!("Taker Wallet not found."),
-    };
-    let arbs_xkey = match arb_wallet {
-        Some(wallet) => get_new_descriptor(wallet, KeychainKind::External),
-        None => panic!("Arbitrator Wallet not found."),
-    };
-
-    // Handcoding this policy. Compiled and verified using https://bitcoin.sipa.be/miniscript/
-    // Policy: or(10@thresh(2,pk(A),pk(B)),and(pk(C), older(576)))
-    // Miniscript: or_i(and_v(v:pkh(C),older(576)),and_v(v:pk(A),pk(B)))
-    // Descriptor: wsh(or_i(and_v(v:pkh(C),older(576)),and_v(v:pk(A),pk(B))))
-
-    // let descriptor = format!("wsh(or_i(and_v(v:pkh({}),older(576)),and_v(v:pk({}),pk({}))))", arbs_xkey.to_string(), maker_xkey.to_string(), taker_xkey.to_string());
-    let policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(576)))", maker_xkey, taker_xkey, arbs_xkey);
-    println!("Policy: {}", policy_string);
-    
-    let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
-    let descriptor = Descriptor::new_wsh(policy.compile().unwrap()).unwrap();
-
-    Wallet::new(
-        &format!("{}", descriptor),
-        None,
-        network,
-        MemoryDatabase::default(),
-    )
-    .unwrap()
-
-}
-
-fn create_multisig_wallet(
-    a_wallet: &Option<Wallet<MemoryDatabase>>,
-    b_wallet: &Option<Wallet<MemoryDatabase>>,
-    network: Network,
-) -> Wallet<MemoryDatabase> {
-    let a_xkey = match a_wallet {
-        Some(wallet) => get_new_descriptor(wallet, KeychainKind::External),
-        None => panic!("A Wallet not found."),
-    };
-    let b_xkey = match b_wallet {
-        Some(wallet) => get_new_descriptor(wallet, KeychainKind::External),
-        None => panic!("B Wallet not found."),
-    };
-
-    let policy_string = format!("thresh(2,pk({}),pk({}))", a_xkey, b_xkey);
-    println!("Policy: {}", policy_string);
-    
-    let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
-    let descriptor = Descriptor::new_wsh(policy.compile().unwrap()).unwrap();
-
-    Wallet::new(
-        &format!("{}", descriptor),
-        None,
-        network,
-        MemoryDatabase::default(),
-    )
-    .unwrap()
-
-}
-
-// Generate Address (to fund Wallet)
+// 2b. Generate Address
 
 fn generate_addr(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     match some_wallet {
@@ -315,7 +256,7 @@ fn generate_addr(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     }
 }
 
-// Query Wallet
+// 3. Query Wallet
 
 fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     match some_wallet {
@@ -335,122 +276,6 @@ fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
     }
 }
 
-// Select UTXO (not under use consideration)
-
-fn get_available_utxos(wallet: &Wallet<MemoryDatabase>) -> Vec<(LocalUtxo, usize)> {
-    // WARNING: This assumes that the wallet has enough funds to cover the input amount
-    wallet
-        .list_unspent()
-        .unwrap()
-        .into_iter()
-        .map(|utxo| {
-            let keychain = utxo.keychain;
-            (
-                utxo,
-                wallet
-                    .get_descriptor_for_keychain(keychain)
-                    .max_satisfaction_weight()
-                    .unwrap(),
-            )
-        })
-        .collect()
-}
-
-const COINBASE_MATURITY: u32 = 100;
-
-fn preselect_utxos(
-    wallet: &Wallet<MemoryDatabase>,
-    blockchain: &ElectrumBlockchain,
-    must_only_use_confirmed_tx: bool,
-) -> Result<Vec<WeightedUtxo>, Error> {
-    let mut may_spend = get_available_utxos(wallet);
-
-    // Make sure UTXOs at least have minimum number of confirmations
-    let satisfies_confirmed = may_spend
-        .iter()
-        .map(|u| {
-            wallet.get_tx(&u.0.outpoint.txid, true).map(|tx| match tx {
-                // We don't have the tx in the db for some reason,
-                // so we can't know for sure if it's mature or not.
-                // We prefer not to spend it.
-                None => false,
-                Some(tx) => {
-                    // Whether the UTXO is mature and, if needed, confirmed
-                    let mut spendable = true;
-                    if must_only_use_confirmed_tx && tx.confirmation_time.is_none() {
-                        return false;
-                    }
-                    if tx
-                        .transaction
-                        .expect("We specifically ask for the transaction above")
-                        .is_coin_base()
-                    {
-                        let current_height = blockchain.get_height().unwrap();
-                        match &tx.confirmation_time {
-                            Some(t) => {
-                                // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
-                                spendable &=
-                                    (current_height.saturating_sub(t.height)) >= COINBASE_MATURITY;
-                            }
-                            None => spendable = false,
-                        }
-                    }
-                    spendable
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut i = 0;
-    may_spend.retain(|_u| {
-        // WARNING: Removed check on Change Policy
-        let retain = satisfies_confirmed[i];
-        i += 1;
-        retain
-    });
-
-    let may_spend = may_spend
-        .into_iter()
-        .map(|(local_utxo, satisfaction_weight)| WeightedUtxo {
-            satisfaction_weight,
-            utxo: Utxo::Local(local_utxo),
-        })
-        .collect();
-
-    Ok(may_spend)
-}
-
-fn select_utxos(
-    some_wallet: &Option<Wallet<MemoryDatabase>>,
-    blockchain: &ElectrumBlockchain,
-    input_amt: u64,
-) {
-    match some_wallet {
-        Some(wallet) => {
-            // Ensure there are enough funds to cover the input amount
-            let balance = wallet.get_balance().unwrap();
-            if balance.confirmed < input_amt {
-                print!("Insufficient funds");
-                return;
-            }
-
-            let optional_utxos = preselect_utxos(wallet, &blockchain, true).unwrap();
-
-            let coin_selection_result = DefaultCoinSelectionAlgorithm::default().coin_select(
-                wallet.database().borrow().deref(),
-                vec![],
-                optional_utxos,
-                FeeRate::from_sat_per_vb(5.0),
-                input_amt,
-                &Script::default(),
-            );
-
-            println!("Coin Selection Result: {:?}", coin_selection_result);
-        }
-        None => println!("Wallet not found"),
-    }
-}
-
 // 4a. Maker Create Initial Commit PSBT
 // Maker will only add the it's input and corresponding change output
 // Taker will complete the transaction by adding the 2nd input and also the multi-sig output
@@ -466,21 +291,24 @@ fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>) -> Strin
             println!("What is the maker's bond amount?");
             let bond_amount = get_user_input().parse::<u64>().unwrap();
 
-            // Create PSBT with a fixed fee as the total amount, receipient as the change address
+            // Create PSBT with a fixed fee as the total amount
+            // The wallet will automatically select UTXO and add the necessary change output
             let mut builder = wallet.build_tx();
             builder
                 .enable_rbf()
                 .fee_absolute(payout_amount + bond_amount)
                 .add_recipient(Script::new_op_return(&[]), 0);
             let (psbt, details) = builder.finish().unwrap();
-            println!("PSBT: {:#?}", psbt);
+            println!("PSBT: {:#?}\n", psbt);
+            println!("Details: {:#?}\n", details);
 
             // Serialize and display PSBT
             let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
-            println!("Encoded PSBT: {}", encoded_psbt);
-            println!("");
-            println!("Details: {:#?}", details);
+            println!("Encoded PSBT: {}\n", encoded_psbt);
 
+            // Generate and display new Maker pubkey
+            let maker_pubkey = generate_pubkey(some_wallet);
+            println!("Maker's Pubkey: {}\n", maker_pubkey);
             encoded_psbt
         }
         None => {
@@ -495,26 +323,39 @@ fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>) -> Strin
 // However the Taker will also specify more output amount than the amount of input its going to fund
 // So the Maker cannot defraud the Taker in any case
 
-fn complete_maker_sell_psbt(taker_wallet: &Option<Wallet<MemoryDatabase>>, multi_wallet:&Option<Wallet<MemoryDatabase>>, commit_psbt: &String) -> String {
-    let taker_wallet = if let Some(wallet) = taker_wallet {
+fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_xprv: &Option<ExtendedPrivKey>, commit_psbt: &Option<String>) -> String {
+    let wallet = if let Some(wallet) = some_wallet {
         wallet
     } else {
         println!("Taker Wallet not found");
         return "".to_string();
     };
 
-    let multi_wallet = if let Some(wallet) = multi_wallet {
-        wallet
+    let xprv = if let Some(xprv) = some_xprv {
+        xprv
     } else {
-        println!("Multi Wallet not found");
+        println!("Taker xprv not found");
+        return "".to_string();
+    };
+
+    let psbt = if let Some(psbt) = commit_psbt {
+        psbt
+    } else {
+        println!("Commit PSBT not found");
         return "".to_string();
     };
 
     // See if the PSBT is valid
     let psbt = general_purpose::STANDARD_NO_PAD
-        .decode(&commit_psbt)
+        .decode(&psbt)
         .unwrap();
     let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+
+    // Ask user for maker pubkey
+    println!("What is the maker's pubkey?");
+    let maker_pubkey = get_user_input();
+
+    // Ask user for arbitrator's pubkey
 
     // Ask user for the agree upon payout amount
     println!("What is the payout amount?");
@@ -524,15 +365,15 @@ fn complete_maker_sell_psbt(taker_wallet: &Option<Wallet<MemoryDatabase>>, multi
     println!("What is the taker's bond amount?");
     let bond_amount = get_user_input().parse::<u64>().unwrap();
 
-    // We are assuming the the arbitrator & maker pubkeys are passed in
-    // And in combination with the taker pubkey, we creatd a Multisig + HTLC wallet
-    // When in fact we have pre-created the wallet in step 1d.
+    // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
+    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network);
 
     // Get Receipient Address from Mutlisig/HTLC wallet
-    let multi_wallet_address = multi_wallet.get_address(AddressIndex::New).unwrap();
+    let multi_wallet_address = trade_wallet.get_address(AddressIndex::New).unwrap();
 
-    // Make created Script receipient to total amount (payout + bonds)
-    let mut builder = taker_wallet.build_tx();
+    // Make created Script recipient to total amount (payout + bonds)
+    let mut builder = wallet.build_tx();
+    builder.enable_rbf();
     builder.add_recipient(multi_wallet_address.script_pubkey(), payout_amount + 2*bond_amount);
     
     // We need to combine this with the Maker's PSBT...
@@ -561,31 +402,41 @@ fn complete_maker_sell_psbt(taker_wallet: &Option<Wallet<MemoryDatabase>>, multi
     };
     
     // Taker signs PSBT
-    let finalized = taker_wallet.sign(&mut psbt, sign_options).unwrap();
+    let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
     println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    println!("Details: {:#?}\n", details);
 
     // Serialize and display PSBT
     let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
-    println!("Encoded PSBT: {}", encoded_psbt);
-    println!("");
-    println!("Details: {:#?}", details);
+    println!("Encoded PSBT: {}\n", encoded_psbt);
+
+    // Generate and display new Maker pubkey
+    let maker_pubkey = generate_pubkey(some_wallet);
+    println!("Taker's Pubkey: {}\n", maker_pubkey);
     encoded_psbt
 
 }
 
 // 4c. Sign Commit PSBT, probably the Maker
 
-fn sign_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, commit_psbt: &String) -> String {
+fn sign_broadcast_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>, commit_psbt: &Option<String>) {
     let wallet = if let Some(wallet) = some_wallet {
         wallet
     } else {
         println!("Maker Wallet not found");
-        return "".to_string();
+        return;
+    };
+
+    let psbt = if let Some(psbt) = commit_psbt {
+        psbt
+    } else {
+        println!("Commit PSBT not found");
+        return;
     };
 
     // See if the PSBT is valid
     let psbt = general_purpose::STANDARD_NO_PAD
-        .decode(&commit_psbt)
+        .decode(&psbt)
         .unwrap();
     let mut psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
 
@@ -598,33 +449,8 @@ fn sign_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, commit_psbt: &String)
     let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
     println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
 
-    // Serialize and display PSBT
-    let encoded_psbt = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
-    println!("Encoded PSBT: {}", encoded_psbt);
-    encoded_psbt
+    let psbt_tx = psbt.extract_tx();
+    blockchain.broadcast(&psbt_tx).unwrap();
+    println!("Broadcasted Tx: {:#?}", psbt_tx);
 
-}
-
-// 4d. Broadcast Commit Tx
-
-fn broadcast_psbt(blockchain: &ElectrumBlockchain, commit_psbt: &String) {
-
-    // See if the PSBT is valid
-    let psbt = general_purpose::STANDARD_NO_PAD
-        .decode(&commit_psbt)
-        .unwrap();
-    let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
-
-    blockchain.broadcast(&psbt.extract_tx()).unwrap();
-}
-
-fn print_psbt(commit_psbt: &String) {
-    // See if the PSBT is valid
-    let psbt = general_purpose::STANDARD_NO_PAD
-        .decode(&commit_psbt)
-        .unwrap();
-    let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
-
-    println!("PartiallySignedTransaction: {:#?}", psbt);
-    println!("");
 }
