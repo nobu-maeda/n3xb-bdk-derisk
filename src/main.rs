@@ -33,7 +33,7 @@ use std::str::FromStr;
 
 use bdk::bitcoin::consensus::{deserialize, encode::serialize};
 use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
-use bdk::bitcoin::{Network, Script};
+use bdk::bitcoin::{Network, Script, Address};
 use bdk::blockchain::{ElectrumBlockchain, Blockchain};
 use bdk::database::MemoryDatabase;
 use bdk::electrum_client::Client;
@@ -114,7 +114,9 @@ fn main() {
                 "3c" => query_wallet(&taker_wallet),
                 "4a" => temp_psbt = Some(create_maker_sell_psbt(&maker_wallet)),
                 "4b" => temp_psbt = Some(complete_maker_sell_psbt(&taker_wallet, &taker_xprv, &temp_psbt)),
-                "4c" => sign_broadcast_psbt(&blockchain, &maker_wallet, &temp_psbt),
+                "4c" => sign_broadcast_commit_psbt(&blockchain, &maker_wallet, &temp_psbt),
+                "5a" => temp_psbt = Some(create_payout_psbt(&blockchain, &taker_wallet, &taker_xprv)),
+                "5b" => sign_broadcast_payout_psbt(&blockchain, &maker_xprv, &temp_psbt),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -142,11 +144,16 @@ fn sync_wallets(wallets: Vec<&Wallet<MemoryDatabase>>, blockchain: &ElectrumBloc
 fn create_trade_wallet(
     a_xprv: &ExtendedPrivKey,
     b_pubkey: String,
-    network: Network
+    network: Network,
+    flip: bool,
 ) -> Wallet<MemoryDatabase> {
 
     // policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(576)))", maker_xkey, taker_xkey, arbs_xkey);
-    let policy_string = format!("thresh(2,pk({}),pk({}))", a_xprv.to_string(), b_pubkey);
+    let policy_string = if flip {
+        format!("thresh(2,pk({}),pk({}))", b_pubkey, a_xprv.to_string())
+    } else {
+        format!("thresh(2,pk({}),pk({}))", a_xprv.to_string(), b_pubkey)
+    };
     println!("Policy: {}", policy_string);
 
     let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
@@ -233,9 +240,9 @@ fn generate_pubkey(some_wallet: &Option<Wallet<MemoryDatabase>>) -> String {
     let script_pubkey = new_address.script_pubkey();
     let secp = wallet.secp_ctx();
     let xpub = wallet.get_descriptor_for_keychain(KeychainKind::External);
-    let (_, descriptor) = xpub.find_derivation_index_for_spk(secp, &script_pubkey, 0..100).unwrap().unwrap();
+    let (index, descriptor) = xpub.find_derivation_index_for_spk(secp, &script_pubkey, 0..100).unwrap().unwrap();
 
-    println!("New Descriptor: {}", descriptor);
+    println!("Index: {}  Descriptor: {}", index, descriptor);
     println!("Original Adddress: {}, Derived Address: {}", new_address, descriptor.address(wallet.network()).unwrap());
 
     let extracted_key = extract_substring_between_brackets(descriptor.to_string().as_str()).unwrap();
@@ -366,7 +373,7 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     let bond_amount = get_user_input().parse::<u64>().unwrap();
 
     // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network);
+    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network, false);
 
     // Get Receipient Address from Mutlisig/HTLC wallet
     let multi_wallet_address = trade_wallet.get_address(AddressIndex::New).unwrap();
@@ -419,7 +426,7 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
 
 // 4c. Sign Commit PSBT, probably the Maker
 
-fn sign_broadcast_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>, commit_psbt: &Option<String>) {
+fn sign_broadcast_commit_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>, commit_psbt: &Option<String>) {
     let wallet = if let Some(wallet) = some_wallet {
         wallet
     } else {
@@ -447,6 +454,123 @@ fn sign_broadcast_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wal
     };
 
     let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
+    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+
+    let psbt_tx = psbt.extract_tx();
+    blockchain.broadcast(&psbt_tx).unwrap();
+    println!("Broadcasted Tx: {:#?}", psbt_tx);
+
+}
+
+// 5a. Create Payout PSBT, probably by the Taker
+
+fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>, some_xprv: &Option<ExtendedPrivKey>) -> String {
+    let wallet = if let Some(wallet) = some_wallet {
+        wallet
+    } else {
+        println!("Taker Wallet not found");
+        return "".to_string();
+    };
+
+    let xprv = if let Some(xprv) = some_xprv {
+        xprv
+    } else {
+        println!("Taker xprv not found");
+        return "".to_string();
+    };
+
+    // Ask user for Maker pubkey
+    println!("What is the Maker's pubkey?");
+    let maker_pubkey = get_user_input();
+
+    // Ask user for the Arbitrator pubkey
+
+    // Ask user for Maker address
+    println!("What is the Maker's address?");
+    let maker_address_string = get_user_input();
+    let maker_address = Address::from_str(&maker_address_string).unwrap();
+    
+    // Ask user for Maker's amount
+    println!("What is the Maker's amount?");
+    let maker_amount = get_user_input().parse::<u64>().unwrap();
+
+    // Create an address to get the Taker's amount
+    let taker_address = wallet.get_address(AddressIndex::New).unwrap();
+
+    // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
+    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network, false);
+    trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
+
+    let trade_balance = trade_wallet.get_balance().unwrap();
+    println!("Trade Wallet Balance: {:#?}", trade_balance);
+
+    // Payout the approrpriate amount to the Taker and the Maker accordingly
+    let mut builder = trade_wallet.build_tx();
+    builder
+    .enable_rbf()
+    .add_recipient(maker_address.script_pubkey(), maker_amount)
+    .drain_to(taker_address.script_pubkey());
+    
+    let (mut psbt, details) = builder.finish().unwrap();
+
+    let sign_options = SignOptions {
+        // try_finalize = false;
+        ..Default::default()
+    };
+    
+    // Signs PSBT
+    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
+    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    println!("Details: {:#?}\n", details);
+
+    // Serialize and display PSBT
+    let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
+    println!("Encoded PSBT: {}\n", encoded_psbt);
+    encoded_psbt
+
+}
+
+fn sign_broadcast_payout_psbt(blockchain: &ElectrumBlockchain, some_xprv: &Option<ExtendedPrivKey>, payout_psbt: &Option<String>) {
+    let xprv = if let Some(xprv) = some_xprv {
+        xprv
+    } else {
+        println!("Maker xprv not found");
+        return;
+    };
+
+    let psbt = if let Some(psbt) = payout_psbt {
+        psbt
+    } else {
+        println!("Payout PSBT not found");
+        return;
+    };
+
+    // See if the PSBT is valid
+    let psbt = general_purpose::STANDARD_NO_PAD
+        .decode(&psbt)
+        .unwrap();
+    let mut psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+
+    // Ask user for Taker pubkey
+    println!("What is the Taker's pubkey?");
+    let pubkey = get_user_input();
+
+    // Create a trade wallet using Maker's xprv, Taker's pubkey and Arbitrator's pubkey
+    let trade_wallet = create_trade_wallet(xprv, pubkey, xprv.network, true);
+    trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
+
+    let trade_balance = trade_wallet.get_balance().unwrap();
+    println!("Trade Wallet Balance: {:#?}", trade_balance);
+
+    // In reality, Maker should check every aspect of the PSBT before signing. Especially the outputs.
+
+    // Sign and finalize the PSBT
+    let sign_options = SignOptions {
+        // try_finalize = false;
+        ..Default::default()
+    };
+
+    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
     println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
 
     let psbt_tx = psbt.extract_tx();
