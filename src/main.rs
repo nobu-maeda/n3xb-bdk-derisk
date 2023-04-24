@@ -28,7 +28,9 @@
 // 11. Implement Tx2 confirmation check
 
 use base64::{engine::general_purpose, Engine as _};
-use bdk::bitcoin::util::bip32::ExtendedPrivKey;
+use bdk::bitcoin::secp256k1::Secp256k1;
+use bdk::bitcoin::util::bip32::{ExtendedPrivKey, ExtendedPubKey, DerivationPath, KeySource};
+use bdk::keys::DescriptorKey;
 use std::str::FromStr;
 
 use bdk::bitcoin::consensus::{deserialize, encode::serialize};
@@ -48,7 +50,7 @@ use bdk::{
 };
 
 use miniscript::policy::Concrete;
-use miniscript::Descriptor;
+use miniscript::{Descriptor, Legacy, Segwitv0};
 
 fn main() {
     let network = Network::Testnet;
@@ -87,18 +89,18 @@ fn main() {
         println!("  1a. Seed Arbitrator Wallet");
         println!("  1b. Seed Maker Wallet");
         println!("  1c. Seed Taker Wallet");
-        println!("  2a. Generate Pubkey from Arbitrator Wallet");
+        println!("  2a. Generate xPub & xPriv from Arbitrator Wallet - Req key index");
         println!("  2b. Generate Address from Maker Wallet");
         println!("  2c. Generate Address from Taker Wallet");
         println!("  3a. Query Arbitrator Wallet");
         println!("  3b. Query Maker Wallet");
         println!("  3c. Query Taker Wallet");
-        println!("  4a. Create Maker Sell PSBT (Maker)");  // Needs Payout amount, Bond amount. Also generates Maker pubkey
-        println!("  4b. Complete Maker Sell PSBT (Taker)");  // Needs Maker pubkey, Arb pubkey, Payout Amount, Bond Amount
-        println!("  4c. Sign & Broadcast PSBT (Maker)");
-        println!("  5a. Create Payout PSBT (Taker)");  // Needs Maker pubkey, Maker address, Maker amount, Taker amount
-        println!("  5b. Sign & Broadcast Payout PSBT (Maker)");  // Needs Taker pubkey
-        println!("  5c. Arbitrate Payout (Arbitrator)"); // Needs Taker pubkey, Maker pubkey, Payout address
+        println!("  4a. Create Maker Sell PSBT (Maker) - Req Payout amount, Bond amount. Generates Maker xPub & xPriv"); 
+        println!("  4b. Complete Maker Sell PSBT (Taker) - Req Maker pubkey, Arb pubkey, Payout amount, Bond amount. Generates Taker contract descriptor");
+        println!("  4c. Sign & Broadcast PSBT (Maker) - Req Maker xPrv. Generates Maker contract descriptor");
+        println!("  5a. Create Payout PSBT (Taker) - Req Taker contract descriptor, Taker amount, Maker address, Maker amount");
+        println!("  5b. Sign & Broadcast Payout PSBT (Maker) - Req Maker contract descriptor");
+        println!("  5c. Arbitrate Payout (Arbitrator) - Req Arb xPriv, Maker pubkey, Taker pubkey");
 
         let user_input = get_user_input();
         {
@@ -106,16 +108,16 @@ fn main() {
                 "1a" => (arb_wallet, arb_xprv) = create_wallet(network),
                 "1b" => (maker_wallet, maker_xprv) = create_wallet(network),
                 "1c" => (taker_wallet, taker_xprv) = create_wallet(network),
-                "2a" => _ = generate_pubkey(&arb_wallet),
+                "2a" => _ = generate_priv_pub(&arb_wallet, &arb_xprv),
                 "2b" => generate_addr(&maker_wallet),
                 "2c" => generate_addr(&taker_wallet),
                 "3a" => query_wallet(&arb_wallet),
                 "3b" => query_wallet(&maker_wallet),
                 "3c" => query_wallet(&taker_wallet),
-                "4a" => temp_psbt = Some(create_maker_sell_psbt(&maker_wallet)),
+                "4a" => temp_psbt = Some(create_maker_sell_psbt(&maker_wallet, &maker_xprv)),
                 "4b" => temp_psbt = Some(complete_maker_sell_psbt(&taker_wallet, &taker_xprv, &temp_psbt)),
                 "4c" => sign_broadcast_commit_psbt(&blockchain, &maker_wallet, &temp_psbt),
-                "5a" => temp_psbt = Some(create_payout_psbt(&blockchain, &taker_wallet, &taker_xprv)),
+                "5a" => temp_psbt = Some(create_payout_psbt(&blockchain, &taker_wallet)),
                 "5b" => sign_broadcast_payout_psbt(&blockchain, &maker_xprv, &temp_psbt),
                 _ => println!("Invalid input. Please input a number."),
             }
@@ -142,7 +144,7 @@ fn sync_wallets(wallets: Vec<&Wallet<MemoryDatabase>>, blockchain: &ElectrumBloc
 }
 
 fn create_trade_wallet(
-    a_xprv: &ExtendedPrivKey,
+    a_xprv: String,
     b_pubkey: String,
     network: Network,
     flip: bool,
@@ -150,17 +152,19 @@ fn create_trade_wallet(
 
     // policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(576)))", maker_xkey, taker_xkey, arbs_xkey);
     let policy_string = if flip {
-        format!("thresh(2,pk({}),pk({}))", b_pubkey, a_xprv.to_string())
+        format!("thresh(2,pk({}),pk({}))", b_pubkey, a_xprv)
     } else {
-        format!("thresh(2,pk({}),pk({}))", a_xprv.to_string(), b_pubkey)
+        format!("thresh(2,pk({}),pk({}))", a_xprv, b_pubkey)
     };
     println!("Policy: {}", policy_string);
 
     let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
     let descriptor = Descriptor::new_wsh(policy.compile().unwrap()).unwrap();
+    let descriptor_string = format!("{}", descriptor);
+    println!("Wallet Descriptor: {}", descriptor_string);
 
     Wallet::new(
-        &format!("{}", descriptor),
+        descriptor_string.as_str(),
         None,
         network,
         MemoryDatabase::default(),
@@ -228,26 +232,68 @@ fn extract_substring_between_brackets(input: &str) -> Option<String> {
     }
 }
 
-fn generate_pubkey(some_wallet: &Option<Wallet<MemoryDatabase>>) -> String {
-    let wallet = match some_wallet {
-        Some(wallet) => wallet,
-        None => {
-            println!("Wallet not found.");
-            return "".to_string();
-        }
+fn generate_priv_pub(some_wallet:&Option<Wallet<MemoryDatabase>>, some_xprv:&Option<ExtendedPrivKey>) -> (String, String) {
+    let wallet = if let Some(wallet) = some_wallet {
+        wallet
+    } else {
+        println!("Taker Wallet not found");
+        return ("".to_string(), "".to_string());
     };
-    let new_address = wallet.get_address(AddressIndex::New).unwrap();
-    let script_pubkey = new_address.script_pubkey();
-    let secp = wallet.secp_ctx();
-    let xpub = wallet.get_descriptor_for_keychain(KeychainKind::External);
-    let (index, descriptor) = xpub.find_derivation_index_for_spk(secp, &script_pubkey, 0..100).unwrap().unwrap();
 
-    println!("Index: {}  Descriptor: {}", index, descriptor);
-    println!("Original Adddress: {}, Derived Address: {}", new_address, descriptor.address(wallet.network()).unwrap());
+    let xprv = if let Some(xprv) = some_xprv {
+        xprv
+    } else {
+        println!("Taker xprv not found");
+        return ("".to_string(), "".to_string());
+    };
 
-    let extracted_key = extract_substring_between_brackets(descriptor.to_string().as_str()).unwrap();
-    println!("Extracted PubKey: {}", extracted_key);
-    extracted_key
+    // Ask user for agreed upon payout amount
+    println!("At what key index?");
+    let key_index = get_user_input().parse::<u64>().unwrap();
+
+    let secp = Secp256k1::new();
+
+    // BDK Wallet generates new (testnet) addresses with m/84'/1'/0'/0/* for deposits (Keychain::External) 
+    // m/84'/1'/1'/0/* for change (Keychain::Internal). With the first non-hardened index as the 'account' number.
+    // 
+    // For this example, we are going to generate new keys for multi-sig contract purposes with an account number of 6102.
+    // This doesn't necessarily help with wallet backup nor determining address reuse. There's no way for wallet restoration
+    // to figure out which is the last used inedex as no key or addresses, not even a hash of it, can be derived from the 
+    // blockchain itself. Counterparties' keys are required to even have a chance ot figure out which local keys have been used 
+    // and thus the corresponding deriviation paths and private keys to sign.
+    // 
+    // Wallets must backup actual wallet descriptors that contains xpub used, deriviation paths metadata and counterparty 
+    // public keys to have a chance of restoring in-progress trade contracts
+
+    // The following printout code can be used to verify and confirm the above findings
+
+    // let new_address = wallet.get_address(AddressIndex::New).unwrap();
+    // println!("Wallet new Address: {}, Type: {}",new_address.to_string(), new_address.address_type().unwrap().to_string());
+
+    // let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
+    // let derived_xpriv = xprv.derive_priv(&secp, &path).unwrap();
+    // let derived_xpub = ExtendedPubKey::from_priv(&secp, &derived_xpriv);
+    // let derived_pubkey = PublicKey::new(derived_xpub.public_key);
+    // println!("Derived xPub: {}", derived_xpub.to_string());
+    // println!("Public Key: {}", derived_xpub.public_key.to_string());
+    // println!("P2WPKH Address: {}", Address::p2wpkh(&derived_pubkey, wallet.network()).unwrap().to_string());
+
+    let coin_index = match wallet.network() {
+        Network::Bitcoin => 0,
+        Network::Testnet => 1,
+        Network::Regtest => 3,
+        Network::Signet => 2,
+    };
+    let derivation_string = format!("m/84'/{}'/0'/6102'/{}", coin_index, key_index);
+    let path = DerivationPath::from_str(derivation_string.as_str()).unwrap();
+    let derived_xpriv = xprv.derive_priv(&secp, &path).unwrap();
+    let derived_xpub = ExtendedPubKey::from_priv(&secp, &derived_xpriv);
+
+    println!("Derivation Path: {}", derivation_string);
+    println!("Derived xPriv: {}", derived_xpriv.to_string());
+    println!("Derived xPub: {}", derived_xpub.to_string());
+    (derived_xpriv.to_string(), derived_xpub.to_string())
+
 }
 
 // 2b. Generate Address
@@ -287,7 +333,7 @@ fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
 // Maker will only add the it's input and corresponding change output
 // Taker will complete the transaction by adding the 2nd input and also the multi-sig output
 
-fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>) -> String {
+fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_xprv: &Option<ExtendedPrivKey>) -> String {
     match some_wallet {
         Some(wallet) => {
             // Ask user for agreed upon payout amount
@@ -306,16 +352,17 @@ fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>) -> Strin
                 .fee_absolute(payout_amount + bond_amount)
                 .add_recipient(Script::new_op_return(&[]), 0);
             let (psbt, details) = builder.finish().unwrap();
-            println!("PSBT: {:#?}\n", psbt);
+            // println!("PSBT: {:#?}\n", psbt);
             println!("Details: {:#?}\n", details);
 
             // Serialize and display PSBT
             let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
             println!("Encoded PSBT: {}\n", encoded_psbt);
 
-            // Generate and display new Maker pubkey
-            let maker_pubkey = generate_pubkey(some_wallet);
-            println!("Maker's Pubkey: {}\n", maker_pubkey);
+            // Generate and display new Maker xPub & xPriv
+            println!("Maker's Derived xPub & xPriv");
+            _ = generate_priv_pub(some_wallet, some_xprv);
+            
             encoded_psbt
         }
         None => {
@@ -338,7 +385,7 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
         return "".to_string();
     };
 
-    let xprv = if let Some(xprv) = some_xprv {
+    _ = if let Some(xprv) = some_xprv {
         xprv
     } else {
         println!("Taker xprv not found");
@@ -372,8 +419,12 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     println!("What is the taker's bond amount?");
     let bond_amount = get_user_input().parse::<u64>().unwrap();
 
+    // Derive a new xPriv & xPub pair
+    println!("Taker's Derived xPub & xPriv");
+    let (taker_xpriv, _) = generate_priv_pub(some_wallet, some_xprv);
+
     // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network, false);
+    let trade_wallet = create_trade_wallet(taker_xpriv, maker_pubkey, wallet.network(), false);
 
     // Get Receipient Address from Mutlisig/HTLC wallet
     let multi_wallet_address = trade_wallet.get_address(AddressIndex::New).unwrap();
@@ -410,16 +461,14 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     
     // Taker signs PSBT
     let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
-    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
     println!("Details: {:#?}\n", details);
 
     // Serialize and display PSBT
     let encoded_psbt: String = general_purpose::STANDARD_NO_PAD.encode(&serialize(&psbt));
     println!("Encoded PSBT: {}\n", encoded_psbt);
 
-    // Generate and display new Maker pubkey
-    let maker_pubkey = generate_pubkey(some_wallet);
-    println!("Taker's Pubkey: {}\n", maker_pubkey);
+    // Generate and display
     encoded_psbt
 
 }
@@ -464,7 +513,7 @@ fn sign_broadcast_commit_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Opt
 
 // 5a. Create Payout PSBT, probably by the Taker
 
-fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>, some_xprv: &Option<ExtendedPrivKey>) -> String {
+fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>) -> String {
     let wallet = if let Some(wallet) = some_wallet {
         wallet
     } else {
@@ -472,18 +521,9 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
         return "".to_string();
     };
 
-    let xprv = if let Some(xprv) = some_xprv {
-        xprv
-    } else {
-        println!("Taker xprv not found");
-        return "".to_string();
-    };
-
     // Ask user for Maker pubkey
-    println!("What is the Maker's pubkey?");
-    let maker_pubkey = get_user_input();
-
-    // Ask user for the Arbitrator pubkey
+    println!("What is the Taker contract descriptor?");
+    let contract_descriptor = get_user_input();
 
     // Ask user for Maker address
     println!("What is the Maker's address?");
@@ -498,7 +538,7 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     let taker_address = wallet.get_address(AddressIndex::New).unwrap();
 
     // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(xprv, maker_pubkey, xprv.network, false);
+    let trade_wallet = Wallet::new(contract_descriptor.as_str(), None, wallet.network(), MemoryDatabase::default()).unwrap();
     trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
 
     let trade_balance = trade_wallet.get_balance().unwrap();
@@ -551,12 +591,16 @@ fn sign_broadcast_payout_psbt(blockchain: &ElectrumBlockchain, some_xprv: &Optio
         .unwrap();
     let mut psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
 
+    // What was the Maker's derived xPriv
+    println!("What was the Maker's derived xPriv?");
+    let maker_xpriv = get_user_input();
+
     // Ask user for Taker pubkey
     println!("What is the Taker's pubkey?");
-    let pubkey = get_user_input();
+    let taker_pubkey = get_user_input();
 
     // Create a trade wallet using Maker's xprv, Taker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(xprv, pubkey, xprv.network, true);
+    let trade_wallet = create_trade_wallet(maker_xpriv, taker_pubkey, xprv.network, true);
     trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
 
     let trade_balance = trade_wallet.get_balance().unwrap();
