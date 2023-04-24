@@ -1,36 +1,7 @@
-// Tx 1 Creation
-// Maker Flow(wallet, input amount, output amount) -> PBST, pubkey (for multi-sig)
-// Taker Flow(wallet, input amount, output amount, maker pubkey, pbst) -> pbst
-// Taker Sign(wallet, input amount, output amoutn, pbst) -> pbst
-// Maker Sign(wallet, input amount, output amount, pbst) -> pbst
-// Maker Broadcast(pbst)
-// ?? How does Maker and Taker keep track of the existence of the resulting Multi-Sig?
-//
-// Check Tx1
-// Maker look for confirmation for Tx, checks all relevant balances once complete
-// Taker looks for confirmation for Tx, checks all relevant balances once complete
-//
-// Tx 2 Creation
-// Taker Sign(wallet, multi-sig input?, maker output amount, taker output amount) -> pbst
-// Maker Sign(wallet, mutli-sig input?, maker output amount, taker output amount) -> Pbst
-// Maker Broadcast(pbst)
-//
-// Check Tx2
-// Maker look for confirmation for Tx, checks all relevant balances once complete
-// Taker looks for confirmation for Tx, checks all relevant balances once complete
-
-// TODOs:
-// 6. Understand PBST formatting while creating Tx1
-// 7. Implement Tx1 Creation
-// 8. Implement Tx1 tracking / database?
-// 9. Implement Tx1 confirmation check
-// 10. Implement Tx2 Creation
-// 11. Implement Tx2 confirmation check
-
 use base64::{engine::general_purpose, Engine as _};
 use bdk::bitcoin::secp256k1::Secp256k1;
-use bdk::bitcoin::util::bip32::{ExtendedPrivKey, ExtendedPubKey, DerivationPath, KeySource};
-use bdk::keys::DescriptorKey;
+use bdk::bitcoin::util::bip32::{ExtendedPrivKey, ExtendedPubKey, DerivationPath};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use bdk::bitcoin::consensus::{deserialize, encode::serialize};
@@ -50,7 +21,7 @@ use bdk::{
 };
 
 use miniscript::policy::Concrete;
-use miniscript::{Descriptor, Legacy, Segwitv0};
+use miniscript::Descriptor;
 
 fn main() {
     let network = Network::Testnet;
@@ -96,11 +67,11 @@ fn main() {
         println!("  3b. Query Maker Wallet");
         println!("  3c. Query Taker Wallet");
         println!("  4a. Create Maker Sell PSBT (Maker) - Req Payout amount, Bond amount. Generates Maker xPub & xPriv"); 
-        println!("  4b. Complete Maker Sell PSBT (Taker) - Req Maker pubkey, Arb pubkey, Payout amount, Bond amount. Generates Taker contract descriptor");
-        println!("  4c. Sign & Broadcast PSBT (Maker) - Req Maker xPrv. Generates Maker contract descriptor");
+        println!("  4b. Complete Maker Sell PSBT (Taker) - Req Maker pubkey, Arb pubkey, Payout amount, Bond amount. Generates Taker xPub & xPriv & contract descriptor");
+        println!("  4c. Sign & Broadcast PSBT (Maker)");
         println!("  5a. Create Payout PSBT (Taker) - Req Taker contract descriptor, Taker amount, Maker address, Maker amount");
-        println!("  5b. Sign & Broadcast Payout PSBT (Maker) - Req Maker contract descriptor");
-        println!("  5c. Arbitrate Payout (Arbitrator) - Req Arb xPriv, Maker pubkey, Taker pubkey");
+        println!("  5b. Sign & Broadcast Payout PSBT (Maker) - Req Maker xPrv, Taker pubkey, Arbitrator pubkey");
+        println!("  5c. Arbitrate Payout (Arbitrator) - Req Arbitrator xPriv, Maker pubkey, Taker pubkey");
 
         let user_input = get_user_input();
         {
@@ -119,6 +90,7 @@ fn main() {
                 "4c" => sign_broadcast_commit_psbt(&blockchain, &maker_wallet, &temp_psbt),
                 "5a" => temp_psbt = Some(create_payout_psbt(&blockchain, &taker_wallet)),
                 "5b" => sign_broadcast_payout_psbt(&blockchain, &maker_xprv, &temp_psbt),
+                "5c" => sign_broadcast_arb_payout(&blockchain, &arb_wallet),
                 _ => println!("Invalid input. Please input a number."),
             }
         }
@@ -144,18 +116,14 @@ fn sync_wallets(wallets: Vec<&Wallet<MemoryDatabase>>, blockchain: &ElectrumBloc
 }
 
 fn create_trade_wallet(
-    a_xprv: String,
-    b_pubkey: String,
+    a_xkey_string: String,
+    b_xkey_string: String,
+    arb_xkey_string: String,
     network: Network,
-    flip: bool,
 ) -> Wallet<MemoryDatabase> {
 
-    // policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(576)))", maker_xkey, taker_xkey, arbs_xkey);
-    let policy_string = if flip {
-        format!("thresh(2,pk({}),pk({}))", b_pubkey, a_xprv)
-    } else {
-        format!("thresh(2,pk({}),pk({}))", a_xprv, b_pubkey)
-    };
+    // Arbitrator can drain the wallet in 1 hour for test. Normally this should be 4 days (576 blocks)
+    let policy_string = format!("or(10@thresh(2,pk({}),pk({})),and(pk({}),older(6)))", a_xkey_string, b_xkey_string, arb_xkey_string);
     println!("Policy: {}", policy_string);
 
     let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
@@ -410,6 +378,8 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     let maker_pubkey = get_user_input();
 
     // Ask user for arbitrator's pubkey
+    println!("What is the arbitrator's pubkey?");
+    let arb_pubkey = get_user_input();
 
     // Ask user for the agree upon payout amount
     println!("What is the payout amount?");
@@ -424,10 +394,13 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     let (taker_xpriv, _) = generate_priv_pub(some_wallet, some_xprv);
 
     // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(taker_xpriv, maker_pubkey, wallet.network(), false);
+    let trade_wallet = create_trade_wallet(maker_pubkey , taker_xpriv, arb_pubkey, wallet.network());
 
     // Get Receipient Address from Mutlisig/HTLC wallet
     let multi_wallet_address = trade_wallet.get_address(AddressIndex::New).unwrap();
+
+    // Display policies of the wallet
+    println!("Trade Wallet Policies: {:#?}", trade_wallet.policies(KeychainKind::External));
 
     // Make created Script recipient to total amount (payout + bonds)
     let mut builder = wallet.build_tx();
@@ -503,7 +476,7 @@ fn sign_broadcast_commit_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Opt
     };
 
     let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
-    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
 
     let psbt_tx = psbt.extract_tx();
     blockchain.broadcast(&psbt_tx).unwrap();
@@ -541,12 +514,20 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     let trade_wallet = Wallet::new(contract_descriptor.as_str(), None, wallet.network(), MemoryDatabase::default()).unwrap();
     trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
 
+    // Display policies of the wallet
+    println!("Trade Wallet Policies: {:#?}", trade_wallet.policies(KeychainKind::External));
+
     let trade_balance = trade_wallet.get_balance().unwrap();
     println!("Trade Wallet Balance: {:#?}", trade_balance);
+
+    let policy_node_id = trade_wallet.policies(KeychainKind::External).unwrap().unwrap().id;
+    let mut policy_path = BTreeMap::new();
+    policy_path.insert(policy_node_id, vec![0]);
 
     // Payout the approrpriate amount to the Taker and the Maker accordingly
     let mut builder = trade_wallet.build_tx();
     builder
+    .policy_path(policy_path, KeychainKind::External)
     .enable_rbf()
     .add_recipient(maker_address.script_pubkey(), maker_amount)
     .drain_to(taker_address.script_pubkey());
@@ -560,7 +541,7 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     
     // Signs PSBT
     let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
-    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
     println!("Details: {:#?}\n", details);
 
     // Serialize and display PSBT
@@ -599,8 +580,12 @@ fn sign_broadcast_payout_psbt(blockchain: &ElectrumBlockchain, some_xprv: &Optio
     println!("What is the Taker's pubkey?");
     let taker_pubkey = get_user_input();
 
+    // Ask user for Arbitrator's pubkey
+    println!("What is the Arbitrator's pubkey?");
+    let arb_pubkey = get_user_input();
+
     // Create a trade wallet using Maker's xprv, Taker's pubkey and Arbitrator's pubkey
-    let trade_wallet = create_trade_wallet(maker_xpriv, taker_pubkey, xprv.network, true);
+    let trade_wallet = create_trade_wallet(maker_xpriv, taker_pubkey, arb_pubkey, xprv.network);
     trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
 
     let trade_balance = trade_wallet.get_balance().unwrap();
@@ -615,7 +600,69 @@ fn sign_broadcast_payout_psbt(blockchain: &ElectrumBlockchain, some_xprv: &Optio
     };
 
     let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
-    println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+
+    let psbt_tx = psbt.extract_tx();
+    blockchain.broadcast(&psbt_tx).unwrap();
+    println!("Broadcasted Tx: {:#?}", psbt_tx);
+
+}
+
+fn sign_broadcast_arb_payout(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wallet<MemoryDatabase>>) {
+    let wallet = if let Some(wallet) = some_wallet {
+        wallet
+    } else {
+        println!("Arbitrator Wallet not found");
+        return;
+    };
+
+     // What was the Abitrator's derived xPriv
+     println!("What was the Arbitrator's derived xPriv?");
+     let arb_xpriv = get_user_input();
+ 
+     // Ask user for Maker pubkey
+     println!("What is the Maker's pubkey?");
+     let maker_pubkey = get_user_input();
+ 
+     // Ask user for Taker pubkey
+     println!("What is the Taker's pubkey?");
+     let taker_pubkey = get_user_input();
+
+    // Create an address for draining
+    let address = wallet.get_address(AddressIndex::New).unwrap();
+
+    // Create a trade wallet using Arb's xprv, Maker's pubkey and Taker's pubkey
+    let trade_wallet = create_trade_wallet(maker_pubkey, taker_pubkey, arb_xpriv, wallet.network());
+    trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
+
+    // Display policies of the wallet
+    println!("Trade Wallet Policies: {:#?}", trade_wallet.policies(KeychainKind::External));
+
+    let trade_balance = trade_wallet.get_balance().unwrap();
+    println!("Trade Wallet Balance: {:#?}", trade_balance);
+
+    let policy_node_id = trade_wallet.policies(KeychainKind::External).unwrap().unwrap().id;
+    let mut policy_path = BTreeMap::new();
+    policy_path.insert(policy_node_id, vec![1]);
+
+    // Create a transaction to drain the trade wallet
+    let mut builder = trade_wallet.build_tx();
+    builder
+    .policy_path(policy_path, KeychainKind::External)
+    .enable_rbf()
+    .drain_to(address.script_pubkey());
+
+    let (mut psbt, details) = builder.finish().unwrap();
+
+    // Sign and finalize the PSBT
+    let sign_options = SignOptions {
+        // try_finalize = false;
+        ..Default::default()
+    };
+
+    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
+    // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
+    println!("Details: {:#?}\n", details);
 
     let psbt_tx = psbt.extract_tx();
     blockchain.broadcast(&psbt_tx).unwrap();
