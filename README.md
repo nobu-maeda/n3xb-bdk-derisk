@@ -64,6 +64,8 @@ Create 2 of 2 multi-sig + timelock for Arbitration. Payout from the 2 of 2 the a
 5. Use **4c** to have the Maker wallet sign the completed PSBT. If successful it will be broadcasted to Testnet.
 6. You can find the TxID for the funding transaction by using **3b** or **3c** and look for either the latest, or the unconfirmed transaction. It should say `confirmation_time: None`.
 
+[Example TxID - c19345415e93af33096c00f06b90f03bb71102fdf98d23746fc3777f360231b6](https://mempool.space/testnet/tx/c19345415e93af33096c00f06b90f03bb71102fdf98d23746fc3777f360231b6)
+
 #### **Multi-sig tx to payout the amount and return the bonds**
 
 Make sure the funding transaction have at least 1 confirmation.
@@ -74,6 +76,8 @@ Make sure the funding transaction have at least 1 confirmation.
 5. You can find the TxID for the funding transaction by using **3b** or **3c** and look for either the latest, or the unconfirmed transaction. It should say `confirmation_time: None`.
 6. Confirmed balance of Maker and Taker wallet should increase as expected once the payout transaction has at least 1 confirmation.
 
+[Example TxID - 37c648e8e81838a3459562d2049ac0cc1e74e45f3b7961b2ff6688f3b54affea](https://mempool.space/testnet/tx/37c648e8e81838a3459562d2049ac0cc1e74e45f3b7961b2ff6688f3b54affea)
+
 #### **Arbitrator sweeps funds as timelock hits**
 
 The assumption here is we have a funded multi-sig that has not been paid out. This flow is the alternative scenario to the above flow **Multi-sig tx to payout the amount and return the bonds**.
@@ -82,6 +86,8 @@ The assumption here is we have a funded multi-sig that has not been paid out. Th
 2. Use **5c** to create, sign and broadcast the Arbitrator payout transaction.
 3. You can find the TxID for the funding transaction by using **3a** look for either the latest, or the unconfirmed transaction. It should say `confirmation_time: None`.
 4. Confirmed balance of the Arbitrator wallet should increase as expected once the payout transaction has at least 1 confirmation.
+
+[Example TxID - 09451312645a8be5455c6de0c9500ac108d9bd0d81554a93db9ccb523f06d9ea](https://mempool.space/testnet/tx/09451312645a8be5455c6de0c9500ac108d9bd0d81554a93db9ccb523f06d9ea)
 
 ## Anatomy of the Locking Multi-sig
 
@@ -102,4 +108,6 @@ An equivalent output descriptor, different for each party of the trade (maker vs
 
 For the funding transaction, the maker first attempts to fund the transaction with the amount and the bond that its required to pay by doing UTXO selection. The way to do so using the BDK is to place the total as 'fee' as a placeholder. This forces the BDK wallet to do coin selection that satisfy the total, along with the correct change output, despite having no other actual recipient specified.
 
-The taker will complete the PSBT by adding its share of the funding as input, create the multi-sig output, and teh correct change output for the taker's funding UTXO selected. This also places the responsibility of determining and paying for fees on the taker as desired. 
+The taker will complete the PSBT by adding its share of the funding as input, create the multi-sig output, and teh correct change output for the taker's funding UTXO selected. This also places the responsibility of determining and paying for fees on the taker as desired.
+
+[Example TxID -c19345415e93af33096c00f06b90f03bb71102fdf98d23746fc3777f360231b6](https://mempool.space/testnet/tx/c19345415e93af33096c00f06b90f03bb71102fdf98d23746fc3777f360231b6)
