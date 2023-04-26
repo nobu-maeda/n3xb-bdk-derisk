@@ -67,9 +67,9 @@ fn main() {
         println!("  3b. Query Maker Wallet");
         println!("  3c. Query Taker Wallet");
         println!("  4a. Create Maker Sell PSBT (Maker) - Req Payout amount, Bond amount. Generates Maker xPub & xPriv"); 
-        println!("  4b. Complete Maker Sell PSBT (Taker) - Req Maker pubkey, Arb pubkey, Payout amount, Bond amount. Generates Taker xPub & xPriv & contract descriptor");
+        println!("  4b. Complete Maker Sell PSBT (Taker) - Req Maker pubkey, Arb pubkey, Payout amount, Bond amount. Generates Taker xPub & xPriv & output descriptor");
         println!("  4c. Sign & Broadcast PSBT (Maker)");
-        println!("  5a. Create Payout PSBT (Taker) - Req Taker contract descriptor, Taker amount, Maker address, Maker amount");
+        println!("  5a. Create Payout PSBT (Taker) - Req Taker output descriptor, Maker address, Bond amount");
         println!("  5b. Sign & Broadcast Payout PSBT (Maker) - Req Maker xPrv, Taker pubkey, Arbitrator pubkey");
         println!("  5c. Arbitrate Payout (Arbitrator) - Req Arbitrator xPriv, Maker pubkey, Taker pubkey");
 
@@ -129,7 +129,7 @@ fn create_trade_wallet(
     let policy = Concrete::<String>::from_str(policy_string.as_str()).unwrap();
     let descriptor = Descriptor::new_wsh(policy.compile().unwrap()).unwrap();
     let descriptor_string = format!("{}", descriptor);
-    println!("Wallet Descriptor: {}", descriptor_string);
+    println!("Output Descriptor: {}", descriptor_string);
 
     Wallet::new(
         descriptor_string.as_str(),
@@ -189,29 +189,18 @@ fn create_wallet(network: Network) -> (Option<Wallet<MemoryDatabase>>, Option<Ex
 
 // 2a. Generate Pubkey
 
-fn extract_substring_between_brackets(input: &str) -> Option<String> {
-    let start = input.find('(')?;
-    let end = input.find(')')?;
-
-    if start < end {
-        Some(input[start + 1..end].to_string())
-    } else {
-        None
-    }
-}
-
 fn generate_priv_pub(some_wallet:&Option<Wallet<MemoryDatabase>>, some_xprv:&Option<ExtendedPrivKey>) -> (String, String) {
     let wallet = if let Some(wallet) = some_wallet {
         wallet
     } else {
-        println!("Taker Wallet not found");
+        println!("Wallet not found");
         return ("".to_string(), "".to_string());
     };
 
     let xprv = if let Some(xprv) = some_xprv {
         xprv
     } else {
-        println!("Taker xprv not found");
+        println!("xprv not found");
         return ("".to_string(), "".to_string());
     };
 
@@ -298,8 +287,9 @@ fn query_wallet(some_wallet: &Option<Wallet<MemoryDatabase>>) {
 }
 
 // 4a. Maker Create Initial Commit PSBT
-// Maker will only add the it's input and corresponding change output
-// Taker will complete the transaction by adding the 2nd input and also the multi-sig output
+// Maker will only add the it's input and corresponding change output. The amount is speciied as 'fee' here so that an
+// output will not be added, but the correct input and change output will still be added. Taker will complete the 
+// transaction by adding the 2nd funding input and also the multi-sig output
 
 fn create_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_xprv: &Option<ExtendedPrivKey>) -> String {
     match some_wallet {
@@ -400,7 +390,7 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     let multi_wallet_address = trade_wallet.get_address(AddressIndex::New).unwrap();
 
     // Display policies of the wallet
-    println!("Trade Wallet Policies: {:#?}", trade_wallet.policies(KeychainKind::External));
+    // println!("Trade Wallet Policies: {:#?}", trade_wallet.policies(KeychainKind::External));
 
     // Make created Script recipient to total amount (payout + bonds)
     let mut builder = wallet.build_tx();
@@ -433,7 +423,7 @@ fn complete_maker_sell_psbt(some_wallet: &Option<Wallet<MemoryDatabase>>, some_x
     };
     
     // Taker signs PSBT
-    let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
+    _ = wallet.sign(&mut psbt, sign_options).unwrap();
     // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
     println!("Details: {:#?}\n", details);
 
@@ -475,7 +465,7 @@ fn sign_broadcast_commit_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Opt
         ..Default::default()
     };
 
-    let finalized = wallet.sign(&mut psbt, sign_options).unwrap();
+    _ = wallet.sign(&mut psbt, sign_options).unwrap();
     // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
 
     let psbt_tx = psbt.extract_tx();
@@ -495,8 +485,8 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     };
 
     // Ask user for Maker pubkey
-    println!("What is the Taker contract descriptor?");
-    let contract_descriptor = get_user_input();
+    println!("What is the Taker output descriptor?");
+    let output_descriptor = get_user_input();
 
     // Ask user for Maker address
     println!("What is the Maker's address?");
@@ -504,14 +494,14 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     let maker_address = Address::from_str(&maker_address_string).unwrap();
     
     // Ask user for Maker's amount
-    println!("What is the Maker's amount?");
+    println!("What is the bond amount?");
     let maker_amount = get_user_input().parse::<u64>().unwrap();
 
     // Create an address to get the Taker's amount
     let taker_address = wallet.get_address(AddressIndex::New).unwrap();
 
     // Create a trade wallet using Taker's xprv, Maker's pubkey and Arbitrator's pubkey
-    let trade_wallet = Wallet::new(contract_descriptor.as_str(), None, wallet.network(), MemoryDatabase::default()).unwrap();
+    let trade_wallet = Wallet::new(output_descriptor.as_str(), None, wallet.network(), MemoryDatabase::default()).unwrap();
     trade_wallet.sync(blockchain, SyncOptions::default()).unwrap();
 
     // Display policies of the wallet
@@ -540,7 +530,7 @@ fn create_payout_psbt(blockchain: &ElectrumBlockchain, some_wallet: &Option<Wall
     };
     
     // Signs PSBT
-    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
+    _ = trade_wallet.sign(&mut psbt, sign_options).unwrap();
     // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
     println!("Details: {:#?}\n", details);
 
@@ -599,7 +589,7 @@ fn sign_broadcast_payout_psbt(blockchain: &ElectrumBlockchain, some_xprv: &Optio
         ..Default::default()
     };
 
-    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
+    _ = trade_wallet.sign(&mut psbt, sign_options).unwrap();
     // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
 
     let psbt_tx = psbt.extract_tx();
@@ -650,7 +640,8 @@ fn sign_broadcast_arb_payout(blockchain: &ElectrumBlockchain, some_wallet: &Opti
     builder
     .policy_path(policy_path, KeychainKind::External)
     .enable_rbf()
-    .drain_to(address.script_pubkey());
+    .drain_to(address.script_pubkey())
+    .drain_wallet();
 
     let (mut psbt, details) = builder.finish().unwrap();
 
@@ -660,7 +651,7 @@ fn sign_broadcast_arb_payout(blockchain: &ElectrumBlockchain, some_wallet: &Opti
         ..Default::default()
     };
 
-    let finalized = trade_wallet.sign(&mut psbt, sign_options).unwrap();
+    _ = trade_wallet.sign(&mut psbt, sign_options).unwrap();
     // println!("PSBT finalized: {}\n{:#?}", finalized, psbt);
     println!("Details: {:#?}\n", details);
 
